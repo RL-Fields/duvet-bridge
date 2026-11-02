@@ -1,0 +1,9 @@
+.env
+*.env
+!*.env.example
+snap_*.json
+*.img
+duvet-env/
+__pycache__/
+*.old
+*.before_*
