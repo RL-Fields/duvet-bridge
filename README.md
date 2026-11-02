@@ -9,6 +9,7 @@ Not affiliated with SmartDuvet. Always keep the level cap and auto-off in place.
 ## What you get in Home Assistant
 
 - **Make bed** button
+- **Duvet off** button (sets both sides to 6)
 - **Duvet left level / right level** sliders (1-11, 6 = off)
 - **Duvet light** (RGB + brightness)
 
@@ -17,6 +18,15 @@ Not affiliated with SmartDuvet. Always keep the level cap and auto-off in place.
 - Auto-off after `MAX_HEAT_HOURS` (default 8)
 - Temperature set to off when the bridge stops or restarts
 - Every temperature write is read back and the real level is reported
+
+## Bluetooth connection
+
+The duvet allows one BLE connection at a time. After a command, the bridge keeps its
+connection open for `IDLE_SECONDS` (default 120) so follow-up changes are quick, then
+closes it. **The phone app cannot connect during that window.** Wait for the log line
+`idle: closing Bluetooth connection`, or stop the service. Set `IDLE_SECONDS` in the
+env file to change it. On startup the bridge reads the box's current levels and light
+state so Home Assistant matches what the duvet is doing.
 
 ## Protocol notes
 
