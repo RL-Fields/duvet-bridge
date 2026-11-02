@@ -8,6 +8,7 @@ PORT = int(os.environ.get("MQTT_PORT", "1883"))
 USER = os.environ.get("MQTT_USER")
 PASS = os.environ.get("MQTT_PASS")
 MAX_HEAT_HOURS = float(os.environ.get("MAX_HEAT_HOURS", "8"))  # auto-off safety
+IDLE_SECONDS = float(os.environ.get("IDLE_SECONDS", "120"))    # keep BLE open after a command
 
 # --- BLE characteristics ---
 def uuid(n): return f"0000{n}-0000-1000-8000-00805f9b34fb"
@@ -32,6 +33,8 @@ LOCK = None
 loop = None
 client = None
 stopping = False
+_client = None
+last_used = 0.0
 
 
 def pk(payload):
@@ -44,22 +47,53 @@ def light_packet(on, r, g, b, br): return pk([LIGHT_TYPE, 1 if on else 0, r, g, 
 def clamp(v, lo, hi): return max(lo, min(hi, v))
 
 
-async def ble_do(fn):
+async def _disconnect():
+    global _client
+    c, _client = _client, None
+    if c is not None:
+        try:
+            await c.disconnect()
+        except Exception as e:
+            print(f"disconnect error: {e}", flush=True)
+
+
+async def ble_do(fn, keep=True):
+    global _client, last_used
     async with LOCK:
         last = None
         for attempt in range(3):
             try:
-                dev = await BleakScanner.find_device_by_filter(
-                    lambda d, a: d.name and "SMARTDUVET" in d.name.upper(), timeout=15)
-                if not dev:
-                    raise RuntimeError("SMARTDUVET not found")
-                async with BleakClient(dev, timeout=20) as c:
-                    return await fn(c)
+                if _client is None or not _client.is_connected:
+                    await _disconnect()
+                    dev = await BleakScanner.find_device_by_filter(
+                        lambda d, a: d.name and "SMARTDUVET" in d.name.upper(), timeout=15)
+                    if not dev:
+                        raise RuntimeError("SMARTDUVET not found")
+                    c = BleakClient(dev, timeout=20)
+                    await c.connect()
+                    _client = c
+                result = await fn(_client)
+                last_used = time.time()
+                if not keep:
+                    await _disconnect()
+                return result
             except Exception as e:
                 last = e
                 print(f"BLE attempt {attempt + 1} failed: {e}", flush=True)
+                await _disconnect()
                 await asyncio.sleep(2)
         raise last
+
+
+async def idle_watchdog():
+    # close the connection after IDLE_SECONDS with no commands, so the phone app can connect
+    while not stopping:
+        await asyncio.sleep(5)
+        if _client is not None and time.time() - last_used > IDLE_SECONDS and not LOCK.locked():
+            async with LOCK:
+                if _client is not None and time.time() - last_used > IDLE_SECONDS:
+                    print("idle: closing Bluetooth connection", flush=True)
+                    await _disconnect()
 
 
 def publish_levels():
@@ -146,6 +180,8 @@ async def handle(topic, payload):
             await make_bed()
         elif topic == f"{BASE}/light/set":
             await set_light(payload)
+        elif topic == f"{BASE}/climate/off":
+            await set_climate(OFF_LEVEL, OFF_LEVEL)
         elif topic == f"{BASE}/climate/left/set":
             await set_climate(int(float(payload)), levels["right"] if levels["right"] else OFF_LEVEL)
         elif topic == f"{BASE}/climate/right/set":
@@ -158,7 +194,7 @@ async def read_startup_levels():
     async def fn(c):
         return await c.read_gatt_char(CLIMATE), await c.read_gatt_char(LIGHT)
     try:
-        rb, lb = await ble_do(fn)
+        rb, lb = await ble_do(fn, keep=False)
         if len(rb) > 5 and 1 <= rb[3] <= 11 and 1 <= rb[5] <= 11:
             levels["left"], levels["right"] = rb[3], rb[5]
         if len(lb) > 6 and lb[2] in (0, 1) and any(lb[3:7]):
@@ -192,6 +228,9 @@ def discovery():
         "button/smartduvet_0003f8/make_bed": {
             "name": "Make bed", "unique_id": "smartduvet_0003f8_make_bed",
             "command_topic": f"{BASE}/bed/press", **avail},
+        "button/smartduvet_0003f8/climate_off": {
+            "name": "Duvet off", "unique_id": "smartduvet_0003f8_climate_off",
+            "command_topic": f"{BASE}/climate/off", "icon": "mdi:power", **avail},
     }
     for side in ("left", "right"):
         cfgs[f"number/smartduvet_0003f8/{side}"] = {
@@ -208,7 +247,7 @@ def on_connect(c, userdata, flags, rc, *args):
     print(f"MQTT connected: {rc}", flush=True)
     discovery()
     c.publish(STATUS, "online", retain=True)
-    for t in ("bed/press", "light/set", "climate/left/set", "climate/right/set"):
+    for t in ("bed/press", "light/set", "climate/off", "climate/left/set", "climate/right/set"):
         c.subscribe(f"{BASE}/{t}")
 
 
@@ -238,6 +277,7 @@ async def main():
 
     asyncio.create_task(read_startup_levels())
     asyncio.create_task(watchdog())
+    asyncio.create_task(idle_watchdog())
     await stop.wait()
 
     stopping = True
@@ -247,6 +287,7 @@ async def main():
             await asyncio.wait_for(set_climate(OFF_LEVEL, OFF_LEVEL), timeout=60)
         except Exception as e:
             print(f"could not confirm off at shutdown: {e}", flush=True)
+    await _disconnect()
     client.publish(STATUS, "offline", retain=True).wait_for_publish(5)
     client.loop_stop()
     client.disconnect()
