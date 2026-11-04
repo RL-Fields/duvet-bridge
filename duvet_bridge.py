@@ -26,6 +26,7 @@ DEV = {"identifiers": ["smartduvet_0003f8"], "name": "SmartDuvet",
        "manufacturer": "SmartDuvet", "model": "v1.3"}
 
 levels = {"left": OFF_LEVEL, "right": OFF_LEVEL}
+want = {"left": OFF_LEVEL, "right": OFF_LEVEL}
 heat_since = None
 last_bed = 0.0
 light = {"state": "OFF", "color": {"r": 255, "g": 255, "b": 255}, "brightness": 128}
@@ -101,25 +102,30 @@ def publish_levels():
         client.publish(f"{BASE}/climate/{side}/state", str(levels[side]), retain=True)
 
 
-async def set_climate(l, r):
+async def set_climate(l=None, r=None):
     global heat_since
-    l, r = clamp(l, MIN_LEVEL, MAX_LEVEL), clamp(r, MIN_LEVEL, MAX_LEVEL)
-    pkt = climate_packet(l, r)
+    # record what is wanted straight away, so two quick commands (left then right) combine
+    if l is not None:
+        want["left"] = clamp(l, MIN_LEVEL, MAX_LEVEL)
+    if r is not None:
+        want["right"] = clamp(r, MIN_LEVEL, MAX_LEVEL)
 
     async def fn(c):
-        await c.write_gatt_char(CLIMATE, pkt, response=True)
+        # read the shared state only once we hold the Bluetooth lock
+        wl, wr = want["left"], want["right"]
+        await c.write_gatt_char(CLIMATE, climate_packet(wl, wr), response=True)
         await asyncio.sleep(1.5)
-        return await c.read_gatt_char(CLIMATE)
+        return wl, wr, await c.read_gatt_char(CLIMATE)
 
     try:
-        rb = await ble_do(fn)
+        wl, wr, rb = await ble_do(fn)
     except Exception as e:
         print(f"climate write failed: {e}", flush=True)
         return
     if len(rb) > 5:
         levels["left"], levels["right"] = rb[3], rb[5]
-        if (rb[3], rb[5]) != (l, r):
-            print(f"WARNING: asked {l}/{r} but box reports {rb[3]}/{rb[5]}", flush=True)
+        if (rb[3], rb[5]) != (wl, wr):
+            print(f"WARNING: asked {wl}/{wr} but box reports {rb[3]}/{rb[5]}", flush=True)
     publish_levels()
     off = levels["left"] in (0, OFF_LEVEL) and levels["right"] in (0, OFF_LEVEL)
     heat_since = None if off else (heat_since or time.time())
@@ -183,9 +189,9 @@ async def handle(topic, payload):
         elif topic == f"{BASE}/climate/off":
             await set_climate(OFF_LEVEL, OFF_LEVEL)
         elif topic == f"{BASE}/climate/left/set":
-            await set_climate(int(float(payload)), levels["right"] if levels["right"] else OFF_LEVEL)
+            await set_climate(l=int(float(payload)))
         elif topic == f"{BASE}/climate/right/set":
-            await set_climate(levels["left"] if levels["left"] else OFF_LEVEL, int(float(payload)))
+            await set_climate(r=int(float(payload)))
     except Exception as e:
         print(f"handler error on {topic}: {e}", flush=True)
 
@@ -197,6 +203,7 @@ async def read_startup_levels():
         rb, lb = await ble_do(fn, keep=False)
         if len(rb) > 5 and 1 <= rb[3] <= 11 and 1 <= rb[5] <= 11:
             levels["left"], levels["right"] = rb[3], rb[5]
+            want["left"], want["right"] = rb[3], rb[5]
         if len(lb) > 6 and lb[2] in (0, 1) and any(lb[3:7]):
             light["state"] = "ON" if lb[2] == 1 else "OFF"
             light["color"] = {"r": lb[3], "g": lb[4], "b": lb[5]}
